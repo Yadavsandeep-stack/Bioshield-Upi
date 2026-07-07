@@ -11,29 +11,48 @@ from functools import wraps
 
 import bcrypt
 import jwt
+import redis
 from flask import Flask, request, jsonify, send_from_directory
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
-from deepface import DeepFace
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 from models import db, User, KeystrokeProfile, RiskEvent, Transaction
+from config import config
 
-
+# Initialize Flask app
 app = Flask(__name__, static_folder='static', template_folder='templates')
 CORS(app, supports_credentials=True)
 
-app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'bioshield-secret-2024-change-in-prod')
-app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get(
-    'DATABASE_URL', 'sqlite:///bioshield.db'
-)
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+# Load configuration
+env = os.environ.get('FLASK_ENV', 'development')
+app.config.from_object(config.get(env, config['development']))
 
+# Initialize extensions
 db.init_app(app)
 
+# Redis connection for OTP storage
+try:
+    redis_url = os.environ.get('REDIS_URL', 'redis://localhost:6379/0')
+    redis_client = redis.from_url(redis_url, decode_responses=True)
+    redis_client.ping()
+    print("✓ Redis connected")
+except Exception as e:
+    print(f"⚠ Redis connection failed: {e}. Using in-memory OTP store.")
+    redis_client = None
+
+# Fallback in-memory OTP store if Redis is unavailable
 otp_store = {}
 
 FACE_STORAGE_DIR = os.path.join(os.path.dirname(os.path.abspath(__name__)), 'face_data')
 os.makedirs(FACE_STORAGE_DIR, exist_ok=True)
+
+# ────────────────────────────────────────────────────────────────
+# HELPERS
+# ────────────────────────────────────────────────────────────────
 
 def save_base64_image(b64_string, file_path):
     """Helper to decode base64 from frontend to a jpg file"""
@@ -42,7 +61,6 @@ def save_base64_image(b64_string, file_path):
     image_data = base64.b64decode(b64_string)
     with open(file_path, "wb") as fh:
         fh.write(image_data)
-
 
 
 def generate_token(user_id: int) -> str:
@@ -68,7 +86,6 @@ def require_auth(f):
             return jsonify({'error': 'Invalid token'}), 401
         return f(*args, **kwargs)
     return decorated
-
 
 
 def extract_features(keystroke_data: dict) -> dict:
@@ -204,26 +221,51 @@ def build_baseline_from_samples(samples: list) -> dict:
 
 def generate_otp(user_id: int) -> str:
     otp = ''.join(random.choices(string.digits, k=6))
-    otp_store[user_id] = {
+    expiry_minutes = app.config.get('OTP_EXPIRY_MINUTES', 5)
+    expires_at = datetime.utcnow() + timedelta(minutes=expiry_minutes)
+    
+    otp_data = {
         'otp': otp,
-        'expires_at': datetime.utcnow() + timedelta(minutes=5)
+        'expires_at': expires_at.isoformat()
     }
+    
+    if redis_client:
+        redis_client.setex(f'otp:{user_id}', expiry_minutes * 60, json.dumps(otp_data))
+    else:
+        otp_store[user_id] = otp_data
+    
     return otp
 
 
 def verify_otp(user_id: int, otp: str) -> bool:
-    record = otp_store.get(user_id)
-    if not record:
-        return False
-    if datetime.utcnow() > record['expires_at']:
+    if redis_client:
+        stored = redis_client.get(f'otp:{user_id}')
+        if not stored:
+            return False
+        otp_data = json.loads(stored)
+        if datetime.fromisoformat(otp_data['expires_at']) < datetime.utcnow():
+            redis_client.delete(f'otp:{user_id}')
+            return False
+        if otp_data['otp'] != otp:
+            return False
+        redis_client.delete(f'otp:{user_id}')
+        return True
+    else:
+        record = otp_store.get(user_id)
+        if not record:
+            return False
+        if datetime.utcnow() > record['expires_at']:
+            del otp_store[user_id]
+            return False
+        if record['otp'] != otp:
+            return False
         del otp_store[user_id]
-        return False
-    if record['otp'] != otp:
-        return False
-    del otp_store[user_id]
-    return True
+        return True
 
 
+# ────────────────────────────────────────────────────────────────
+# ROUTES – PAGES
+# ────────────────────────────────────────────────────────────────
 
 @app.route('/')
 @app.route('/login')
@@ -255,6 +297,9 @@ def serve_static(filename):
     return send_from_directory('static', filename)
 
 
+# ────────────────────────────────────────────────────────────────
+# API ROUTES – AUTH
+# ────────────────────────────────────────────────────────────────
 
 @app.route('/api/signup', methods=['POST'])
 def signup():
@@ -315,6 +360,9 @@ def login():
     })
 
 
+# ────────────────────────────────────────────────────────────────
+# API ROUTES – BIOMETRIC ENROLLMENT
+# ────────────────────────────────────────────────────────────────
 
 @app.route('/api/enroll', methods=['POST'])
 @require_auth
@@ -365,12 +413,17 @@ def enroll_face():
     if not face_image_b64:
         return jsonify({'error': 'No image provided'}), 400
 
-    file_path = os.path.join(FACE_STORAGE_DIR, f"user_{request.user_id}_ref.jpg")
-    save_base64_image(face_image_b64, file_path)
+    try:
+        file_path = os.path.join(FACE_STORAGE_DIR, f"user_{request.user_id}_ref.jpg")
+        save_base64_image(face_image_b64, file_path)
+        return jsonify({'message': 'Facial DNA enrolled successfully'})
+    except Exception as e:
+        return jsonify({'error': f'Face enrollment failed: {str(e)}'}), 400
 
-    return jsonify({'message': 'Facial DNA enrolled successfully'})
 
-
+# ────────────────────────────────────────────────────────────────
+# API ROUTES – TESTING & RECOGNITION
+# ────────────────────────────────────────────────────────────────
 
 @app.route('/api/test', methods=['POST'])
 @require_auth
@@ -395,6 +448,9 @@ def test_recognition():
     })
 
 
+# ────────────────────────────────────────────────────────────────
+# API ROUTES – PAYMENT & TRANSACTIONS
+# ────────────────────────────────────────────────────────────────
 
 @app.route('/api/payment', methods=['POST'])
 @require_auth
@@ -438,7 +494,7 @@ def payment():
         otp = generate_otp(request.user_id)
         return jsonify({
             'status': 'OTP_REQUIRED',
-            'otp': otp,
+            'otp': otp if os.environ.get('FLASK_ENV') != 'production' else '(sent to registered mobile)',
             'message': 'OTP sent to your registered mobile number',
             'risk_score': round(risk['score'], 3),
             'event_id': event.id
@@ -471,7 +527,6 @@ def payment():
     })
 
 
-
 @app.route('/api/otp-verify', methods=['POST'])
 @require_auth
 def otp_verify():
@@ -483,7 +538,6 @@ def otp_verify():
 
     if not verify_otp(request.user_id, otp):
         return jsonify({'error': 'Invalid or expired OTP'}), 400
-
 
     user = db.session.get(User, request.user_id)
     if user.balance < amount:
@@ -499,7 +553,6 @@ def otp_verify():
     user.balance -= amount
 
     if event_id:
-
         event = db.session.get(RiskEvent, event_id)
         if event:
             event.resolution = 'PASSED_OTP'
@@ -517,39 +570,40 @@ def otp_verify():
     })
 
 
-
 @app.route('/api/face-verify', methods=['POST'])
 @require_auth
 def face_verify():
     """Real Face ID verification using DeepFace"""
+    try:
+        from deepface import DeepFace
+    except ImportError:
+        return jsonify({'error': 'Face ID service not available'}), 503
+
     data = request.get_json()
     live_face_b64 = data.get('face_image', '')   
     event_id = data.get('event_id')
     amount = float(data.get('amount', 0))
     recipient_upi = data.get('recipient_upi', '')
 
-
-    live_path = os.path.join(FACE_STORAGE_DIR, f"temp_{request.user_id}_live.jpg")
-    save_base64_image(live_face_b64, live_path)
-
-
-    ref_path = os.path.join(FACE_STORAGE_DIR, f"user_{request.user_id}_ref.jpg")
-
-    if not os.path.exists(ref_path):
-        if os.path.exists(live_path):
-            os.remove(live_path)
-        return jsonify({'error': 'No reference face found. Please enroll your face first.'}), 400
-
     try:
+        live_path = os.path.join(FACE_STORAGE_DIR, f"temp_{request.user_id}_live.jpg")
+        save_base64_image(live_face_b64, live_path)
+
+        ref_path = os.path.join(FACE_STORAGE_DIR, f"user_{request.user_id}_ref.jpg")
+
+        if not os.path.exists(ref_path):
+            if os.path.exists(live_path):
+                os.remove(live_path)
+            return jsonify({'error': 'No reference face found. Please enroll your face first.'}), 400
 
         result = DeepFace.verify(
             img1_path=ref_path, 
             img2_path=live_path, 
-            model_name="VGG-Face",
-            enforce_detection=False 
+            model_name=app.config.get('DEEPFACE_MODEL', 'VGG-Face'),
+            enforce_detection=app.config.get('DEEPFACE_ENFORCE_DETECTION', False)
         )
         face_matched = result["verified"]
-        confidence = 1.0 - result["distance"] 
+        confidence = 1.0 - result["distance"]
 
     except Exception as e:
         print("DeepFace Error:", e)
@@ -593,7 +647,9 @@ def face_verify():
     })
 
 
-
+# ────────────────────────────────────────────────────────────────
+# API ROUTES – DASHBOARD & HISTORY
+# ────────────────────────────────────────────────────────────────
 
 @app.route('/api/risk-history', methods=['GET'])
 @require_auth
@@ -603,7 +659,6 @@ def risk_history():
     transactions = Transaction.query.filter_by(user_id=request.user_id)\
         .order_by(Transaction.created_at.desc()).limit(20).all()
     
-
     user = db.session.get(User, request.user_id)
     profile = KeystrokeProfile.query.filter_by(user_id=request.user_id).first()
 
@@ -615,14 +670,41 @@ def risk_history():
     })
 
 
+# ────────────────────────────────────────────────────────────────
+# HEALTH CHECK
+# ────────────────────────────────────────────────────────────────
 
 @app.route('/api/health', methods=['GET'])
 def health():
-    return jsonify({'status': 'ok', 'service': 'BioShield'})
+    return jsonify({
+        'status': 'ok',
+        'service': 'BioShield',
+        'timestamp': datetime.utcnow().isoformat(),
+        'environment': os.environ.get('FLASK_ENV', 'development')
+    }), 200
 
+
+# ─────────��──────────────────────────────────────────────────────
+# ERROR HANDLERS
+# ────────────────────────────────────────────────────────────────
+
+@app.errorhandler(404)
+def not_found(e):
+    return jsonify({'error': 'Resource not found'}), 404
+
+@app.errorhandler(500)
+def server_error(e):
+    return jsonify({'error': 'Internal server error'}), 500
+
+
+# ────────────────────────────────────────────────────────────────
+# INITIALIZATION
+# ────────────────────────────────────────────────────────────────
 
 with app.app_context():
     db.create_all()
+    print("✓ Database initialized")
 
 if __name__ == '__main__':
-    app.run(debug=True, port=5000)
+    debug_mode = os.environ.get('FLASK_ENV') == 'development'
+    app.run(debug=debug_mode, port=5000, host='0.0.0.0')

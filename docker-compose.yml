@@ -1,0 +1,83 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:16-alpine
+    container_name: bioshield-db
+    environment:
+      POSTGRES_DB: bioshield
+      POSTGRES_USER: bioshield
+      POSTGRES_PASSWORD: bioshield_secure_password_change_me
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bioshield"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis for OTP/Cache
+  redis:
+    image: redis:7-alpine
+    container_name: bioshield-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # BioShield Application
+  app:
+    build: .
+    container_name: bioshield-app
+    environment:
+      FLASK_ENV: production
+      SECRET_KEY: ${SECRET_KEY:-bioshield-secret-change-in-prod}
+      DATABASE_URL: postgresql://bioshield:bioshield_secure_password_change_me@postgres:5432/bioshield
+      REDIS_URL: redis://redis:6379/0
+      DEBUG: "False"
+    ports:
+      - "5000:5000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./face_data:/app/face_data
+      - ./logs:/app/logs
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Nginx Reverse Proxy (Optional, for production)
+  nginx:
+    image: nginx:alpine
+    container_name: bioshield-nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./certs:/etc/nginx/certs:ro
+    depends_on:
+      - app
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
+
+networks:
+  default:
+    name: bioshield-network
